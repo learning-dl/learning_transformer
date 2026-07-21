@@ -53,7 +53,7 @@ class SDPAttention(nn.Module):
         for i in range(query_len):
             atte = (q[:, i: i+1, :] * k).sum(dim=-1) / self.sqrt_qkv_dim
             if right_mask:  # 防作弊右侧掩码
-                atte[i+1:] = -1e9
+                atte[:, i+1:] = -1e9
             atte = torch.softmax(atte, dim=-1)
             z = (atte.unsqueeze(-1) * v).sum(dim=1, keepdim=True)
             zz.append(z)
@@ -64,49 +64,59 @@ class MultiHeadAtte(nn.Module):
     def __init__(self, num_head, in_dim, qkv_dim, out_dim):
         super().__init__()
         self.all_atte = nn.ModuleList([SDPAttention(in_dim, qkv_dim) for _ in range(num_head)])
-        self.ffnn = nn.Linear(qkv_dim * num_head, out_dim)
+        self.ffn = nn.Linear(qkv_dim * num_head, out_dim)
 
     def forward(self, em, right_mask=False):
         z_list = [self_atte_layer(em, em, right_mask) for self_atte_layer in self.all_atte]
         z = torch.cat(z_list, dim=-1)
-        return self.ffnn(z)
+        return self.ffn(z)
 
 class MultiHeadCrossAttention(nn.Module):
     def __init__(self, num_head, in_dim, qkv_dim, out_dim):
         super().__init__()
         self.all_atte = nn.ModuleList([SDPAttention(in_dim, qkv_dim) for _ in range(num_head)])
-        self.ffnn = nn.Linear(qkv_dim * num_head, out_dim)
+        self.ffn = nn.Linear(qkv_dim * num_head, out_dim)
 
     def forward(self, qx, kvx):
         z_list = [self_atte_layer(qx, kvx) for self_atte_layer in self.all_atte]
         z = torch.cat(z_list, dim=-1)
-        return self.ffnn(z)
+        return self.ffn(z)
 
 class EncodeBlock(nn.Module):
     def __init__(self, num_head, in_dim, qkv_dim):
         super().__init__()
         self.multi_atte_layer = MultiHeadAtte(num_head, in_dim, qkv_dim, in_dim)
-        self.enc_ff = nn.Linear(in_dim, in_dim)
+        self.enc_ffn = nn.Sequential(
+            nn.Linear(in_dim, in_dim * 2),
+            nn.ReLU(),
+            nn.Linear(in_dim * 2, in_dim)
+        )
+        self.norm = nn.LayerNorm(in_dim)
 
     def forward(self, em):
         z = self.multi_atte_layer(em)
-        z = z + em
-        return self.enc_ff(z) + z
+        z = self.norm(z + em)
+        return self.norm(self.enc_ffn(z) + z)
 
 class DecodeBlock(nn.Module):
     def __init__(self, num_head, in_dim, qkv_dim):
         super().__init__()
         self.multi_atte_layer = MultiHeadAtte(num_head, in_dim, qkv_dim, in_dim)
         self.cross_atte_layer = MultiHeadCrossAttention(num_head, in_dim, qkv_dim, in_dim)
-        self.ffnn = nn.Linear(in_dim, in_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(in_dim, in_dim * 2),
+            nn.ReLU(),
+            nn.Linear(in_dim * 2, in_dim)
+        )
+        self.norm = nn.LayerNorm(in_dim)
 
     def forward(self, em, enc_context):
         z = self.multi_atte_layer(em, right_mask=True)
-        z += em
-        y = self.cross_atte_layer(em, enc_context)
-        y += z
-        y_2 = self.ffnn(y)
-        y_2 += y
+        z = self.norm(z + em)
+        y = self.cross_atte_layer(z, enc_context)
+        y = self.norm(y + z)
+        y_2 = self.ffn(y)
+        y_2 = self.norm(y_2 + y)
         return y_2
 
 
@@ -117,7 +127,11 @@ class Transform(nn.Module):
         self.pos_encoder = PosEncoder(ndim=in_dim, seq_max_len=pe_matrix_len)
         self.encoder = nn.Sequential(*[EncodeBlock(atte_head_num, in_dim, qkv_dim) for _ in range(enc_block_num)])
         self.decoder = nn.ModuleList([DecodeBlock(atte_head_num, in_dim, qkv_dim) for _ in range(dec_block_num)])
-        self.ffnn = nn.Linear(in_dim, dst_vocab)
+        self.ffn = nn.Sequential(
+            nn.Linear(in_dim, in_dim * 2),
+            nn.ReLU(),
+            nn.Linear(in_dim * 2, dst_vocab)
+        )
 
     def forward(self, src, sos, dst_embedding, dst_seq=None):
         """
@@ -138,7 +152,7 @@ class Transform(nn.Module):
             dec_context = dst_em + dst_pem
             for decoder in self.decoder:
                 dec_context = decoder(dec_context, enc_context)
-            return self.ffnn(dec_context)
+            return self.ffn(dec_context)
 
 
 
@@ -168,7 +182,7 @@ class EnFraTrans(nn.Module):
 
         in_dst = dst_data[:, :-1]
         target = dst_data[:, 1:]
-        for _ in range(10):
+        for _ in range(100):
             pred = self.forward(src_data, in_dst)
             loss = loss_fn(pred.permute(0, 2, 1), target)
             print(f'loss:   {loss}')
@@ -186,14 +200,14 @@ if __name__ == "__main__":
     src_vocab = 100
     dst_vocab = 100
 
-    src_data = torch.randint(4, 104, [10000, 12]).to('cuda')
-    dst_data = torch.randint(4, 104, [10000, 10]).to('cuda')
+    src_data = torch.randint(4, 104, [10, 12])
+    dst_data = torch.randint(4, 104, [10, 10])
     src_data[:, 0] = 1
     src_data[:, -1] = 2
     dst_data[:, 0] = 1
     dst_data[:, -1] = 2
 
-    translater = EnFraTrans(104, 104, 128).to('cuda')
+    translater = EnFraTrans(104, 104, 128)
     translater.train_model(src_data, dst_data)
 
 
